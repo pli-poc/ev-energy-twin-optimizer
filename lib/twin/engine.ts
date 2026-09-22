@@ -30,7 +30,19 @@ export function vehiclesFor(c:Config):Vehicle[]{const random=rng(c.seed);const c
  return list;
 }
 export function validateConfig(raw:unknown):Config {const c=raw as Config;if(!c||!presets.some(p=>p.id===c.preset)||!['ems','balanced','immediate'].includes(c.policy)||!Number.isFinite(c.grid)||c.grid<20||c.grid>250||!Number.isFinite(c.solar)||c.solar<0||c.solar>160||!Number.isFinite(c.demand)||c.demand<.5||c.demand>2||!Number.isInteger(c.seed)||c.seed<0||c.seed>100000||!Number.isInteger(c.chargers)||c.chargers<4||c.chargers>20||typeof c.battery!=='boolean'||typeof c.flexible!=='boolean')throw new Error('Invalid scenario. Check capacity, solar, demand, seed and charger values.');return {...c};}
-export function simulate(input:Config):Result{
+// All strategies execute through the same vehicle, site, storage and fault model.
+export type DispatchContext = {
+ time:number; vehicles:Vehicle[]; available:CarState[]; budget:number;
+ building:number; solar:number; batteryPower:number; limit:number;
+};
+export type DispatchDecision = {power:number;reason:string};
+export type SimulationOptions = {
+ price?:(minute:number)=>number;
+ exportPrice?:number;
+ dispatch?:(context:DispatchContext)=>Record<number,DispatchDecision>;
+};
+export function simulate(input:Config,options:SimulationOptions={}):Result{
+ const price=options.price??tariff,exportPrice=options.exportPrice??.07;
  const c=validateConfig(input),vehicles=vehiclesFor(c),events:Event[]=[],frames:Frame[]=[],cars:CarState[]=vehicles.map(v=>({id:v.id,bay:-1,parkedAt:-1,delivered:0,power:0,status:'Expected',reason:'Not on site yet'}));
  let battery=50,temp=21,ready=0,departed=0,shortfall=0,cost=0,importKwh=0,exportKwh=0,delivered=0,peak=0,violations=0,excess=0,comfort=0,taskEnergy=0;
  const emit=(time:number,text:string,type:Event['type']='info',owner='Charging operator')=>events.push({time,text,type,owner});
@@ -48,7 +60,7 @@ export function simulate(input:Config):Result{
   const base=(occupied?23+5*Math.sin((t-450)/660*Math.PI):13)*c.demand;
   const cold=c.preset==='cold';const outdoor=(cold?2:13)+5*daylight;
   const internalHeat=occupied?3:1;
-  const targetTemp=occupied?(c.flexible&&tariff(t)>.3?20:21):18;
+  const targetTemp=occupied?(c.flexible&&price(t)>.3?20:21):18;
   // Single-zone heat balance. Effective envelope loss scales with building demand.
   const thermalResistance=.3/c.demand;
   let hvac=Math.max(0,Math.min(35*c.demand,((targetTemp-outdoor)/thermalResistance-internalHeat+(targetTemp-temp)*24)/3));
@@ -69,22 +81,27 @@ export function simulate(input:Config):Result{
   const policy=offline?'balanced':c.policy;
   let budget=policy==='immediate'?1e6:Math.max(0,limit-3-building+solar+bp);
   if(c.battery&&available.length&&bp>=0){const wanted=Math.min(available.length*8,80);const extra=Math.min(50-bp,Math.max(0,wanted-budget),(battery-50)*60*.95-bp);if(extra>0){bp+=extra;budget+=extra;}}
+  const custom=options.dispatch&&!offline?options.dispatch({time:t,vehicles,available,budget,building,solar,batteryPower:bp,limit}):undefined;
   const cap=(s:CarState)=>Math.min(vehicles[s.id].maxKw,(vehicles[s.id].need-s.delivered)*60/.9);
-  if(policy==='balanced'){
+  if(custom){
+   // A planner requests power; the physical controller enforces current headroom.
+   const ordered=[...available].sort((a,b)=>vehicles[a.id].departure-vehicles[b.id].departure||a.id-b.id);
+   for(const s of ordered){const want=custom[s.id]?.power??0;s.power=Math.min(cap(s),Math.max(0,Number.isFinite(want)?want:0),budget);budget-=s.power;}
+  }else if(policy==='balanced'){
    let rem=[...available].sort((a,b)=>((a.id+Math.floor(t/10))%vehicles.length)-((b.id+Math.floor(t/10))%vehicles.length));
    while(rem.length&&budget>1e-8){const share=budget/rem.length;let progressed=false;for(const s of [...rem]){if(cap(s)<=share){s.power=cap(s);budget-=s.power;rem=rem.filter(x=>x!==s);progressed=true;}}
     if(!progressed){if(share>=1.4){rem.forEach(s=>s.power=share);budget=0;}else{for(const s of rem){if(budget<1.4)break;s.power=Math.min(cap(s),budget,vehicles[s.id].maxKw);budget-=s.power;}break;}}}
   }else{
    const slack=(s:CarState)=>vehicles[s.id].departure-t-(vehicles[s.id].need-s.delivered)/(.9*vehicles[s.id].maxKw)*60;
    const ordered=[...available].sort((a,b)=>policy==='ems'?slack(a)-slack(b)||a.id-b.id:a.id-b.id);
-   for(const s of ordered){let target=cap(s);if(policy==='ems'&&slack(s)>150&&tariff(t)>.3&&solar<building)target=Math.min(target,2.8);if(budget>=1.4||target<1.4){s.power=Math.min(target,budget);budget-=s.power;}}
+   for(const s of ordered){let target=cap(s);if(policy==='ems'&&slack(s)>150&&price(t)>.3&&solar<building)target=Math.min(target,2.8);if(budget>=1.4||target<1.4){s.power=Math.min(target,budget);budget-=s.power;}}
   }
-  for(const s of eligible){const v=vehicles[s.id];if(faulty(s)){s.status='Fault';s.reason='Charger unavailable until 13:00';}else if(sleeping(s)){s.status='Sleeping';s.reason='Vehicle not accepting power · recovery 12:00';}else{s.status=s.power>0?'Charging':'Paused';s.reason=s.power>0?(policy==='ems'?'Allocated by departure urgency and site headroom':policy==='balanced'?'Fair share of current site headroom':'Immediate maximum charging'):'Waiting for available site capacity';}const add=s.power*.9/60;s.delivered+=add;delivered+=add;if(s.delivered>=v.need-.00001){s.status='Ready';s.reason='Requested energy delivered · parked until departure';}}
+  for(const s of eligible){const v=vehicles[s.id];if(faulty(s)){s.status='Fault';s.reason='Charger unavailable until 13:00';}else if(sleeping(s)){s.status='Sleeping';s.reason='Vehicle not accepting power · recovery 12:00';}else{s.status=s.power>0?'Charging':'Paused';s.reason=custom?.[s.id]?.reason??(s.power>0?(policy==='ems'?'Allocated by departure urgency and site headroom':policy==='balanced'?'Fair share of current site headroom':'Immediate maximum charging'):'Waiting for available site capacity');}const add=s.power*.9/60;s.delivered+=add;delivered+=add;if(s.delivered>=v.need-.00001){s.status='Ready';s.reason='Requested energy delivered · parked until departure';}}
   for(const s of cars){const v=vehicles[s.id];if(t>=s.parkedAt+2&&s.parkedAt>=0&&t<v.departure&&s.delivered>=v.need-.00001)s.status='Ready';}
   const ev=cars.reduce((a,s)=>a+s.power,0);
   if(bp<0)battery+=-bp*.95/60;else battery-=bp/.95/60;
   const raw=building+ev-solar-bp,curtailed=Math.max(0,-raw-40);solar-=curtailed;const grid=raw+curtailed;
-  importKwh+=Math.max(0,grid)/60;exportKwh+=Math.max(0,-grid)/60;cost+=(Math.max(0,grid)*tariff(t)-Math.max(0,-grid)*.07)/60;peak=Math.max(peak,grid);
+  importKwh+=Math.max(0,grid)/60;exportKwh+=Math.max(0,-grid)/60;cost+=(Math.max(0,grid)*price(t)-Math.max(0,-grid)*exportPrice)/60;peak=Math.max(peak,grid);
   if(grid>limit+.0001){violations++;excess+=(grid-limit)/60;}
   if(t===600&&c.preset==='fault')emit(t,'Chargers 03 & 04 unavailable · service visit in progress','warning');
   if(t===780&&c.preset==='fault')emit(t,'Chargers 03 & 04 restored','success');
@@ -95,7 +112,7 @@ export function simulate(input:Config):Result{
   if(t===720&&c.preset==='cloud')emit(t,'Solar below forecast · charging allocations revised','warning','Facility manager');
   if(t===540&&c.preset==='capacity')emit(t,'Site import allowance reduced to 50 kW','warning','Facility manager');
   for(const s of eligible){const v=vehicles[s.id];if(t===v.departure-30&&s.delivered<v.need-.1)emit(t,`${v.name} leaves in 30 min · ${(v.need-s.delivered).toFixed(1)} kWh still needed`, 'warning');}
-  frames.push({time:t,building,base,hvac,task,solar,curtailed,grid,limit,ev,batteryPower:bp,batteryKwh:battery,temp,price:tariff(t),cars:cars.map(s=>({...s})),ready,departed,shortfall,cost,importKwh,exportKwh,delivered,peak,violations,excess,queue:cars.filter(s=>s.status==='Queued').length,comfort,taskEnergy});
+  frames.push({time:t,building,base,hvac,task,solar,curtailed,grid,limit,ev,batteryPower:bp,batteryKwh:battery,temp,price:price(t),cars:cars.map(s=>({...s})),ready,departed,shortfall,cost,importKwh,exportKwh,delivered,peak,violations,excess,queue:cars.filter(s=>s.status==='Queued').length,comfort,taskEnergy});
  }
  return{config:c,vehicles,frames,events,final:frames[1439]};
 }

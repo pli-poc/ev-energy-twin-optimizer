@@ -1,21 +1,95 @@
-import {clock,simulate,type Config,type Frame,type Result} from './engine';
+import {clock,simulate,validateConfig,type Config,type DispatchContext,type DispatchDecision,type Result} from './engine';
+
 export type AdvancedPolicy='cheap'|'peak'|'total';
 export type Market='nl'|'flanders'|'wallonia'|'brussels';
-export type OptimizerConfig={policy:AdvancedPolicy;market:Market;peak:number};
-export const optimizerDefaults:OptimizerConfig={policy:'total',market:'nl',peak:85};
-export const advancedPolicies=[{id:'cheap' as const,name:'Cheapest energy',description:'Uses the cheapest feasible quarter-hours before each departure.'},{id:'peak' as const,name:'Peak-aware',description:'Avoids creating a new site peak when vehicles have time to wait.'},{id:'total' as const,name:'Total-cost optimizer',description:'Balances tariff, peak exposure, site headroom and departure urgency.'}];
+export type OptimizerConfig={policy:AdvancedPolicy;market:Market;peak:number;existingMonthlyPeakKw?:number;capacityRateEurPerKwMonth?:number};
+export const optimizerDefaults:OptimizerConfig={policy:'total',market:'nl',peak:85,existingMonthlyPeakKw:85,capacityRateEurPerKwMonth:0};
+export const advancedPolicies=[
+ {id:'cheap' as const,name:'Cheapest energy',description:'Ranks available quarter-hours by modeled energy cost; no claim of a global optimum.'},
+ {id:'peak' as const,name:'Peak-aware',description:'Spreads charging around a preferred peak; urgency can require exceeding that preference.'},
+ {id:'total' as const,name:'Total-cost-aware',description:'A rule-based trade-off between energy price, preferred peak and departure needs.'}
+];
 export const markets=[{id:'nl' as const,name:'Netherlands'},{id:'flanders' as const,name:'Flanders'},{id:'wallonia' as const,name:'Wallonia'},{id:'brussels' as const,name:'Brussels'}];
-const wholesale=(t:number)=>.075+.055*Math.sin((t/60-7)/24*Math.PI*2)+.045*Math.exp(-Math.pow((t/60-19)/2.3,2))-.035*Math.exp(-Math.pow((t/60-13)/2.5,2));
-const network=(m:Market,t:number)=>{const h=t/60;if(m==='wallonia')return (h>=11&&h<17)||(h>=22||h<7)?.025:.085;if(m==='brussels')return h>=7&&h<22?.065:.028;return .035};
-export const retail=(m:Market,t:number)=>Math.max(.02,wholesale(t)+.095+network(m,t));
-export type OptimizerResult=Result&{optimizer:OptimizerConfig;baseline:Result;score:{energy:number;peakCost:number;total:number;peak:number;readyPct:number};explanations:Record<number,string>};
-export function simulateOptimized(baseConfig:Config,opt:OptimizerConfig):OptimizerResult{
- const baseline=simulate({...baseConfig,policy:'balanced',battery:false}),vehicles=baseline.vehicles,cars=vehicles.map(v=>({id:v.id,bay:-1,parkedAt:-1,delivered:0,power:0,status:'Expected',reason:'Not on site yet'})),events=[] as Result['events'],frames=[] as Frame[];
- let cost=0,imp=0,exp=0,del=0,peak=0,ready=0,departed=0,shortfall=0;const plans=vehicles.map(()=>new Array(96).fill(0)),quarterLoad=new Array(96).fill(0);
- // Plan each connected vehicle across feasible 15-minute windows. V1 remains the physical/site baseline.
- for(const v of [...vehicles].sort((a,b)=>a.departure-b.departure)){let need=v.need/.9;const start=Math.ceil((v.arrival+2)/15),end=Math.floor((v.departure-1)/15);const candidates=[] as {q:number;score:number}[];for(let q=start;q<=end;q++){const t=q*15,b=baseline.frames[t],projected=b.building-b.solar+quarterLoad[q],p=retail(opt.market,t),peakPenalty=Math.max(0,projected-opt.peak);let score=p;if(opt.policy==='peak')score=peakPenalty*2+p*.2;if(opt.policy==='total')score=p+peakPenalty*(opt.market==='flanders'?2.5:.8);candidates.push({q,score});}candidates.sort((a,b)=>a.score-b.score||a.q-b.q);for(const x of candidates){if(need<=.001)break;const b=baseline.frames[x.q*15],head=Math.max(0,baseConfig.grid-b.building+b.solar-quarterLoad[x.q]);let preferred=head;if(opt.policy!=='cheap')preferred=Math.min(preferred,Math.max(0,opt.peak-b.building+b.solar-quarterLoad[x.q]));let kw=Math.min(v.maxKw,preferred),kwh=Math.min(need,kw*.25);if(kwh<.05)continue;plans[v.id][x.q]=kwh/.25;quarterLoad[x.q]+=kwh/.25;need-=kwh;}if(need>.001)for(let q=start;q<=end&&need>.001;q++){const b=baseline.frames[q*15],head=Math.max(0,baseConfig.grid-b.building+b.solar-quarterLoad[q]),kw=Math.min(v.maxKw,head),kwh=Math.min(need,kw*.25);plans[v.id][q]+=kwh/.25;quarterLoad[q]+=kwh/.25;need-=kwh;}}
- const explanations:Record<number,string>={};vehicles.forEach(v=>{const qs=plans[v.id].map((p,q)=>({p,q})).filter(x=>x.p>0);explanations[v.id]=qs.length?`Planned in ${qs.length} quarter-hours between ${clock(qs[0].q*15)} and ${clock((qs.at(-1)!.q+1)*15)} to deliver ${v.need} kWh before ${clock(v.departure)}.`:'No feasible allocation found.'});
- for(let t=0;t<1440;t++){const bf=baseline.frames[t],q=Math.floor(t/15);for(const v of vehicles){const s=cars[v.id];s.power=0;if(t===v.arrival){s.status='Queued';s.reason='Waiting for a free charging space';}if(t===v.departure){s.status='Departed';departed++;const gap=Math.max(0,v.need-s.delivered);shortfall+=gap;if(gap<.05)ready++;}if(t<v.arrival||t>=v.departure)continue;const used=new Set(cars.filter(x=>x.id!==s.id&&x.bay>=0&&x.status!=='Departed'&&x.status!=='Expected').map(x=>x.bay));if(s.bay<0){let bay=0;while(used.has(bay)&&bay<baseConfig.chargers)bay++;if(bay<baseConfig.chargers){s.bay=bay;s.parkedAt=t;s.status='Arriving';s.reason='Driving to assigned charger';}}if(s.bay<0)continue;if(t<s.parkedAt+2)continue;const remaining=Math.max(0,v.need-s.delivered);if(remaining<.001){s.status='Ready';s.reason='Requested energy delivered · parked until departure';continue;}s.power=Math.min(plans[v.id][q],v.maxKw,remaining*60/.9);if(s.power>0){s.status='Charging';s.reason=opt.policy==='cheap'?'Low-cost quarter selected':opt.policy==='peak'?'Charging without exceeding the preferred peak':'Best total-cost quarter given price, peak and deadline';}else{s.status='Paused';s.reason='Deferred by optimizer; departure target remains feasible';}const add=s.power*.9/60;s.delivered+=add;del+=add;}
- const ev=cars.reduce((a,s)=>a+s.power,0),grid=bf.building+ev-bf.solar;imp+=Math.max(0,grid)/60;exp+=Math.max(0,-grid)/60;cost+=(Math.max(0,grid)*retail(opt.market,t)-Math.max(0,-grid)*.07)/60;peak=Math.max(peak,grid);frames.push({...bf,ev,grid,limit:baseConfig.grid,price:retail(opt.market,t),cars:cars.map(s=>({...s})),ready,departed,shortfall,cost,importKwh:imp,exportKwh:exp,delivered:del,peak,violations:grid>baseConfig.grid?1:0,excess:Math.max(0,grid-baseConfig.grid)/60,queue:cars.filter(s=>s.status==='Queued').length});}
- const peakCost=opt.market==='flanders'?Math.max(0,peak-opt.peak)*4.45:Math.max(0,peak-opt.peak)*1.2;return{config:baseConfig,vehicles,frames,events,final:frames[1439],optimizer:opt,baseline,score:{energy:cost,peakCost,total:cost+peakCost,peak,readyPct:vehicles.length?ready/vehicles.length*100:100},explanations};
+export const EXPORT_PRICE=.07;
+export function validateOptimizer(raw:unknown):OptimizerConfig{
+ const v=raw as OptimizerConfig;
+ if(!v||!advancedPolicies.some(p=>p.id===v.policy)||!markets.some(m=>m.id===v.market)||!Number.isFinite(v.peak)||v.peak<0||v.peak>250)throw new Error('Invalid optimizer strategy, market or preferred peak.');
+ const existing=v.existingMonthlyPeakKw??v.peak,rate=v.capacityRateEurPerKwMonth??0;
+ if(!Number.isFinite(existing)||existing<0||existing>1000||!Number.isFinite(rate)||rate<0||rate>100)throw new Error('Invalid monthly peak baseline or capacity rate.');
+ return {policy:v.policy,market:v.market,peak:v.peak,existingMonthlyPeakKw:existing,capacityRateEurPerKwMonth:rate};
+}
+// Synthetic weekday tariff shapes, excluding VAT. Not sourced prices or customer bills.
+export function retail(m:Market,minute:number):number{
+ const h=Math.floor(minute/15)/4;
+ const wholesale=.075+.055*Math.sin((h-7)/24*Math.PI*2)+.045*Math.exp(-Math.pow((h-19)/2.3,2))-.035*Math.exp(-Math.pow((h-13)/2.5,2));
+ const network=m==='wallonia'?((h>=11&&h<17)||h>=22||h<7?.025:.085):m==='brussels'?(h>=7&&h<22?.065:.028):.035;
+ return Math.max(.02,wholesale+.095+network);
+}
+export type OptimizerResult=Result&{optimizer:OptimizerConfig;explanations:Record<number,string>};
+
+/** Connected vehicles only; rebuild each quarter or when the active set changes.
+ * Perfect synthetic building/PV forecast; future battery discharge is not assumed.
+ * The shared physical engine applies faults, queuing, storage and current import limits.
+ */
+export function simulateOptimized(input:Config,raw:OptimizerConfig,preparedForecast?:Result):OptimizerResult{
+ const c=validateConfig(input),opt=validateOptimizer(raw),price=(t:number)=>retail(opt.market,t);
+ const forecast=preparedForecast??simulate({...c,policy:'balanced'},{price,exportPrice:EXPORT_PRICE});
+ let signature='',plans:Record<number,Float64Array>={},gaps:Record<number,number>={};
+ const dispatch=(ctx:DispatchContext):Record<number,DispatchDecision>=>{
+  const key=`${Math.floor(ctx.time/15)}:${ctx.available.map(s=>`${s.id}:${s.bay}`).join(',')}`;
+  const requestedNow=ctx.available.reduce((sum,s)=>sum+(plans[s.id]?.[ctx.time]??0),0);
+  if(key!==signature||requestedNow>ctx.budget+1e-6){
+   signature=key;plans={};gaps={};
+   const physical=new Float64Array(1440),preferred=new Float64Array(1440),load=new Float64Array(1440);
+   for(let t=ctx.time;t<1440;t++){
+    const f=forecast.frames[t],net=f.building-f.solar-f.curtailed;
+    physical[t]=Math.max(0,f.limit-3-net);
+    preferred[t]=Math.min(physical[t],Math.max(0,opt.peak-3-net));
+   }
+   // Use measured capacity for the immediate action, including the local battery controller.
+   physical[ctx.time]=ctx.budget;
+   preferred[ctx.time]=Math.min(ctx.budget,Math.max(0,opt.peak-3-ctx.building+ctx.solar+ctx.batteryPower));
+   for(const s of [...ctx.available].sort((a,b)=>ctx.vehicles[a.id].departure-ctx.vehicles[b.id].departure||a.id-b.id)){
+    const v=ctx.vehicles[s.id],plan=new Float64Array(1440);plans[v.id]=plan;
+    let remaining=Math.max(0,v.need-s.delivered)/.9;
+    const candidates:{start:number;end:number;score:number}[]=[];
+    for(let start=ctx.time;start<v.departure;){
+     const end=Math.min(v.departure,(Math.floor(start/15)+1)*15),f=forecast.frames[start];
+     const net=f.building-f.solar-f.curtailed+load[start];
+     const marginal=net<0?Math.min(price(start),net< -40?0:EXPORT_PRICE):price(start);
+     const score=opt.policy==='peak'?Math.max(0,net)/Math.max(1,opt.peak)+price(start)*.05:opt.policy==='total'?marginal+.4*Math.max(0,net+v.maxKw-opt.peak)/Math.max(1,opt.peak):marginal;
+     candidates.push({start,end,score});start=end;
+    }
+    candidates.sort((a,b)=>a.score-b.score||a.start-b.start);
+    const allowed=(t:number)=>!(c.preset==='fault'&&(s.bay===2||s.bay===3)&&t>=600&&t<780)&&!(c.preset==='sleep'&&s.id===31&&t>=660&&t<720);
+    const fill=(soft:boolean)=>{
+     for(const slot of candidates){
+      if(remaining<1e-9)break;
+      for(let t=slot.start;t<slot.end&&remaining>1e-9;t++){
+       if(!allowed(t))continue;
+       const head=soft?Math.min(physical[t],preferred[t]):physical[t];
+       const kw=Math.max(0,Math.min(v.maxKw-plan[t],head,remaining*60));
+       plan[t]+=kw;physical[t]-=kw;preferred[t]=Math.max(0,preferred[t]-kw);load[t]+=kw;remaining-=kw/60;
+      }
+     }
+    };
+    fill(opt.policy!=='cheap');if(remaining>1e-9)fill(false);
+    gaps[v.id]=Math.max(0,remaining*.9);
+   }
+  }
+  const output:Record<number,DispatchDecision>={};
+  for(const s of ctx.available){
+   const v=ctx.vehicles[s.id],plan=plans[s.id],power=plan?.[ctx.time]??0;
+   let next=-1;if(plan)for(let t=ctx.time+1;t<v.departure;t++)if(plan[t]>1e-6){next=t;break;}
+   const plannedBattery=plan?plan.slice(ctx.time,v.departure).reduce((sum,kw)=>sum+kw*.9/60,0):0;
+   const missing=Math.max(0,v.need-s.delivered-plannedBattery);
+   const risk=missing>.05;
+   output[s.id]={power,reason:risk?`Departure at risk: current plan is ${missing.toFixed(1)} kWh short; charging uses available capacity.`:power>0?`Charging under ${advancedPolicies.find(p=>p.id===opt.policy)!.name.toLowerCase()} scheduling; target achievable under the current forecast.`:`Deferred; ${next>=0?'planned resume '+clock(next):'no further charging slot'} under the current forecast. Rechecked at the next plan update.`};
+  }
+  return output;
+ };
+ const result=simulate({...c,policy:'ems'},{price,exportPrice:EXPORT_PRICE,dispatch});
+ const explanations:Record<number,string>={};
+ for(const v of result.vehicles)explanations[v.id]=`Declared departure ${clock(v.departure)}; ${v.need} kWh requested. Current state and forecast, not a guaranteed future outcome.`;
+ return {...result,optimizer:opt,explanations};
 }
