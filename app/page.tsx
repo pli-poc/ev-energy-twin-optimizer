@@ -1,3 +1,3 @@
 "use client";
-import EnergyHubApp from '@/components/twin/EnergyHubApp';
-export default function Home(){return <EnergyHubApp/>;}
+import TwinApp from '@/components/twin/TwinApp';
+export default function Home(){return <TwinApp/>;}
